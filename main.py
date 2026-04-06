@@ -89,6 +89,11 @@ def run():
             logger.info(f"[PRE-PASS {pre_score}/10] {listing['title']!r}")
             finalists.append(listing)
 
+    # Cap finalists at MAX_LLM_CALLS_PER_RUN to avoid runaway on first run
+    if len(finalists) > config.MAX_LLM_CALLS_PER_RUN:
+        logger.info(f"Capping finalists at {config.MAX_LLM_CALLS_PER_RUN} (had {len(finalists)}). Rest deferred.")
+        finalists = finalists[:config.MAX_LLM_CALLS_PER_RUN]
+
     logger.info(f"{len(finalists)} listings passed pre-screen, fetching descriptions.")
 
     # --- Step 3: fetch descriptions for finalists only ---

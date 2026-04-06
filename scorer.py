@@ -47,28 +47,36 @@ def batch_prescreen(listings: list[dict]) -> dict[str, int]:
     if not listings:
         return {}
 
-    lines = []
-    for l in listings:
-        lines.append(
-            f'ID:{l["id"]} | ${l["price"]} | {l["neighborhood"]} | {l["title"]}'
-        )
-    user_msg = "\n".join(lines)
+    # Split into chunks of 30 — keeps prompt/response size manageable
+    CHUNK_SIZE = 30
+    all_scores = {}
 
-    try:
-        response = _get_client().messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=512,
-            system=BATCH_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw = response.content[0].text.strip()
-        results = json.loads(raw)
-        scores = {str(r["id"]): int(r["pre_score"]) for r in results}
-        logger.info(f"Batch pre-screen: {len(scores)} listings scored in 1 call.")
-        return scores
-    except Exception as e:
-        logger.error(f"Batch pre-screen failed: {e} — defaulting all to 6")
-        return {l["id"]: 6 for l in listings}
+    for i in range(0, len(listings), CHUNK_SIZE):
+        chunk = listings[i:i + CHUNK_SIZE]
+        lines = [
+            f'ID:{l["id"]} | ${l["price"]} | {l["neighborhood"]} | {l["title"]}'
+            for l in chunk
+        ]
+        user_msg = "\n".join(lines)
+
+        try:
+            response = _get_client().messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=2048,
+                system=BATCH_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = response.content[0].text.strip()
+            results = json.loads(raw)
+            chunk_scores = {str(r["id"]): int(r["pre_score"]) for r in results}
+            all_scores.update(chunk_scores)
+            logger.info(f"Batch chunk {i//CHUNK_SIZE + 1}: {len(chunk_scores)} listings scored.")
+        except Exception as e:
+            logger.error(f"Batch chunk {i//CHUNK_SIZE + 1} failed: {e} — defaulting to 6")
+            for l in chunk:
+                all_scores[l["id"]] = 6
+
+    return all_scores
 
 
 # ---------------------------------------------------------------------------
