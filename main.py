@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 
 import config
-from database import init_db, is_seen, save_listing, mark_notified
+from database import init_db, is_seen, save_listing, mark_notified, get_daily_llm_calls, increment_llm_calls
 from fetcher import fetch_new_listings, fetch_description
 from scorer import batch_prescreen, score_listing
 from notifier import send_sms
@@ -59,8 +59,24 @@ def run():
         logger.info("No new listings this run.")
         sys.exit(0)
 
+    # --- Daily budget check ---
+    calls_today = get_daily_llm_calls()
+    if calls_today >= config.MAX_LLM_CALLS_PER_DAY:
+        logger.error(
+            f"Daily LLM cap reached ({calls_today}/{config.MAX_LLM_CALLS_PER_DAY}). "
+            "Skipping this run. Check for bugs or raise MAX_LLM_CALLS_PER_DAY."
+        )
+        send_sms(
+            {"title": "RATE LIMIT HIT", "price": 0, "url": "", "neighborhood": ""},
+            {"score": 0, "rent_control_likely": False, "scam_risk": "n/a",
+             "summary": f"Daily LLM cap hit: {calls_today} calls today. Check logs.",
+             "neighborhood": ""},
+        )
+        sys.exit(0)
+
     # --- Step 2: batch pre-screen (1 Haiku call for all new listings) ---
     pre_scores = batch_prescreen(new_listings)
+    increment_llm_calls(1)
 
     finalists = []
     for listing in new_listings:
@@ -91,8 +107,14 @@ def run():
             break
 
         try:
+            # Re-check daily cap before each full score call
+            if get_daily_llm_calls() >= config.MAX_LLM_CALLS_PER_DAY:
+                logger.warning("Daily LLM cap hit mid-run. Stopping full scoring.")
+                break
+
             score_result = score_listing(listing)
             llm_calls += 1
+            increment_llm_calls(1)
 
             if score_result is None:
                 save_listing({**listing, "score": -1, "summary": "full scoring failed"})

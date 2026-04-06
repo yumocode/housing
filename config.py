@@ -17,6 +17,7 @@ SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "7"))
 MAX_PRICE = int(os.getenv("MAX_PRICE", "1000"))
 FETCH_INTERVAL_MINUTES = int(os.getenv("FETCH_INTERVAL_MINUTES", "10"))
 MAX_LLM_CALLS_PER_RUN = int(os.getenv("MAX_LLM_CALLS_PER_RUN", "25"))
+MAX_LLM_CALLS_PER_DAY = int(os.getenv("MAX_LLM_CALLS_PER_DAY", "150"))  # hard daily cap
 
 # RSS Feed
 RSS_URL = f"https://sfbay.craigslist.org/search/sfc/roo?format=rss&max_price={MAX_PRICE}"

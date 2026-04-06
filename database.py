@@ -1,11 +1,11 @@
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-CREATE_TABLE_SQL = """
+CREATE_LISTINGS_SQL = """
 CREATE TABLE IF NOT EXISTS listings (
     id TEXT PRIMARY KEY,
     title TEXT,
@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 """
 
+CREATE_USAGE_SQL = """
+CREATE TABLE IF NOT EXISTS daily_usage (
+    day TEXT PRIMARY KEY,   -- YYYY-MM-DD
+    llm_calls INTEGER DEFAULT 0,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -31,17 +39,17 @@ def get_connection():
 
 def init_db():
     with get_connection() as conn:
-        conn.execute(CREATE_TABLE_SQL)
+        conn.execute(CREATE_LISTINGS_SQL)
+        conn.execute(CREATE_USAGE_SQL)
         conn.commit()
     logger.info("Database initialized.")
 
 
 def is_seen(listing_id: str) -> bool:
     with get_connection() as conn:
-        row = conn.execute(
+        return conn.execute(
             "SELECT 1 FROM listings WHERE id = ?", (listing_id,)
-        ).fetchone()
-        return row is not None
+        ).fetchone() is not None
 
 
 def save_listing(listing: dict):
@@ -57,12 +65,35 @@ def save_listing(listing: dict):
     with get_connection() as conn:
         conn.execute(sql, listing)
         conn.commit()
-    logger.debug(f"Saved listing {listing['id']} to DB.")
 
 
 def mark_notified(listing_id: str):
     with get_connection() as conn:
-        conn.execute(
-            "UPDATE listings SET notified = 1 WHERE id = ?", (listing_id,)
-        )
+        conn.execute("UPDATE listings SET notified = 1 WHERE id = ?", (listing_id,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Daily LLM usage tracking
+# ---------------------------------------------------------------------------
+
+def get_daily_llm_calls(today: str | None = None) -> int:
+    today = today or date.today().isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT llm_calls FROM daily_usage WHERE day = ?", (today,)
+        ).fetchone()
+        return row["llm_calls"] if row else 0
+
+
+def increment_llm_calls(n: int = 1, today: str | None = None):
+    today = today or date.today().isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO daily_usage (day, llm_calls, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET
+                llm_calls = llm_calls + excluded.llm_calls,
+                last_updated = excluded.last_updated
+        """, (today, n, datetime.utcnow().isoformat()))
         conn.commit()
