@@ -1,13 +1,11 @@
 """
-Fetcher — replaces feedparser/RSS with Craigslist's internal JSON API
-via a headless Playwright browser (much harder to block than plain HTTP).
+Fetcher — Craigslist's internal JSON API via headless Playwright.
 
 Flow:
   1. Spin up headless Chromium
-  2. Call sapi.craigslist.org search endpoint → get all listings as JSON
-  3. For each new listing that passes the title keyword filter, fetch the
-     full listing page to grab the description body
-  4. Return a list of listing dicts ready for the scorer
+  2. Call sapi.craigslist.org → get all listings as JSON
+  3. Filter to unseen listings only
+  4. For listings that pass Haiku pre-screen (main.py), fetch descriptions on demand
 """
 
 import logging
@@ -17,7 +15,6 @@ import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 from config import MAX_PRICE
-from filters import passes_keyword_filter
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +35,6 @@ UA = (
 
 
 def _decode_neighborhood(location_str: str, neighborhoods: list) -> str:
-    """
-    Location string format: "area_idx:loc_idx:hood_idx~lat~lng"
-    neighborhoods is a 1-indexed list from the API decode block.
-    """
     try:
         parts = location_str.split("~")[0].split(":")
         hood_idx = int(parts[2])
@@ -54,11 +47,8 @@ def _decode_neighborhood(location_str: str, neighborhoods: list) -> str:
 
 def _parse_postings(data: dict) -> list[dict]:
     """
-    Convert raw API items into flat listing dicts (no description yet).
-
-    The items array uses positional encoding but the image array is optional,
-    which shifts indices for listings without photos. We scan by type/marker
-    instead of hardcoded positions to be resilient to both formats.
+    Convert raw API items into flat listing dicts.
+    Image array is optional so we scan by type markers instead of fixed indices.
     """
     items = data.get("data", {}).get("items", [])
     decode = data.get("data", {}).get("decode", {})
@@ -73,27 +63,24 @@ def _parse_postings(data: dict) -> list[dict]:
             location_str = item[4] if isinstance(item[4], str) else ""
             neighborhood = _decode_neighborhood(location_str, neighborhoods)
 
-            # Scan for slug: list element whose first value is 6
             slug = ""
             title = ""
             for el in item:
                 if isinstance(el, list) and len(el) >= 2 and el[0] == 6:
                     slug = el[1]
                 elif isinstance(el, str) and el and not el.startswith("1:"):
-                    title = el  # bare string = title (location_str starts with "1:")
+                    title = el
 
             if not slug or not title:
-                logger.warning(f"Could not parse slug/title from item: {item}")
+                logger.warning(f"Could not parse slug/title: {item}")
                 continue
-
-            url = f"{LISTING_BASE}/{slug}/{post_id}.html"
 
             listings.append({
                 "id": post_id,
                 "title": title,
                 "price": price,
-                "url": url,
-                "description": "",  # filled in later for new listings
+                "url": f"{LISTING_BASE}/{slug}/{post_id}.html",
+                "description": "",
                 "neighborhood": neighborhood,
                 "score": None,
                 "rent_control_likely": None,
@@ -102,66 +89,28 @@ def _parse_postings(data: dict) -> list[dict]:
                 "notified": False,
             })
         except Exception as e:
-            logger.warning(f"Failed to parse item: {e} — {item}")
+            logger.warning(f"Failed to parse item: {e}")
             continue
 
     return listings
 
 
-def _fetch_description(page, url: str) -> str:
-    """Fetch a single listing page and extract the body text."""
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=15000)
-
-        # Wait for posting body to appear (up to 5s)
-        try:
-            page.wait_for_selector("#postingbody", timeout=5000)
-        except PlaywrightTimeout:
-            pass
-
-        el = page.query_selector("#postingbody")
-        if el:
-            text = el.inner_text().strip()
-            # Remove Craigslist's standard QR code notice
-            text = re.sub(r"QR Code Link to This Post.*", "", text, flags=re.DOTALL).strip()
-            return text[:3000]
-
-        # Fallback: grab visible body text, skip nav/header noise
-        section = page.query_selector("section.body") or page.query_selector("article")
-        if section:
-            return section.inner_text()[:1000]
-        return page.inner_text("body")[:500]
-    except PlaywrightTimeout:
-        logger.warning(f"Timeout fetching description: {url}")
-        return ""
-    except Exception as e:
-        logger.warning(f"Error fetching description {url}: {e}")
-        return ""
-
-
-def fetch_listings(is_seen_fn, max_descriptions: int = 20) -> list[dict]:
+def fetch_new_listings(is_seen_fn) -> list[dict]:
     """
-    Main entry point. Returns a list of new listing dicts with descriptions
-    populated for listings that passed the title-level keyword filter.
-
-    is_seen_fn: callable(listing_id: str) -> bool
-    max_descriptions: cap on individual listing page fetches per run
+    Fetch all listings from Craigslist API, return only ones not yet seen.
+    No filtering — caller decides what to do with them.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=UA)
-        page = context.new_page()
+        page = browser.new_context(user_agent=UA).new_page()
 
-        # --- Step 1: fetch search results JSON ---
         try:
-            logger.info(f"Fetching search API: {SEARCH_API}")
+            logger.info("Fetching Craigslist search API...")
             response = page.request.get(
-                SEARCH_API,
-                headers={"Referer": REFERRER},
-                timeout=20000,
+                SEARCH_API, headers={"Referer": REFERRER}, timeout=20000
             )
             if response.status != 200:
-                logger.error(f"Search API returned {response.status}")
+                logger.error(f"Search API returned HTTP {response.status}")
                 browser.close()
                 return []
             data = response.json()
@@ -171,35 +120,42 @@ def fetch_listings(is_seen_fn, max_descriptions: int = 20) -> list[dict]:
             return []
 
         all_listings = _parse_postings(data)
-        logger.info(f"API returned {len(all_listings)} listings.")
-
-        # --- Step 2: filter to new + title-passes-keywords ---
-        candidates = []
-        for listing in all_listings:
-            if is_seen_fn(listing["id"]):
-                continue
-            title_passes, _ = passes_keyword_filter(listing["title"], "")
-            if not title_passes:
-                logger.info(f"[REJECT-TITLE] {listing['title']!r}")
-                candidates.append({**listing, "score": 0, "summary": "rejected by title keyword filter", "_skip_scoring": True})
-            else:
-                candidates.append(listing)
-
-        logger.info(f"{len(candidates)} new listings to process.")
-
-        # --- Step 3: fetch descriptions for candidates that need scoring ---
-        desc_count = 0
-        for listing in candidates:
-            if listing.get("_skip_scoring"):
-                continue
-            if desc_count >= max_descriptions:
-                logger.warning(f"Hit description fetch limit ({max_descriptions}). Remaining deferred.")
-                break
-            logger.info(f"Fetching description: {listing['title']!r}")
-            listing["description"] = _fetch_description(page, listing["url"])
-            desc_count += 1
-            time.sleep(1.5)  # polite delay between listing page fetches
-
+        logger.info(f"API returned {len(all_listings)} total listings.")
         browser.close()
 
-    return candidates
+    new = [l for l in all_listings if not is_seen_fn(l["id"])]
+    logger.info(f"{len(new)} new (unseen) listings.")
+    return new
+
+
+def fetch_description(url: str) -> str:
+    """Fetch a single listing page and return the description text."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(user_agent=UA).new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            try:
+                page.wait_for_selector("#postingbody", timeout=5000)
+            except PlaywrightTimeout:
+                pass
+
+            el = page.query_selector("#postingbody")
+            if el:
+                text = el.inner_text().strip()
+                text = re.sub(r"QR Code Link to This Post.*", "", text, flags=re.DOTALL).strip()
+                browser.close()
+                return text[:3000]
+
+            section = page.query_selector("section.body") or page.query_selector("article")
+            result = section.inner_text()[:1000] if section else page.inner_text("body")[:500]
+            browser.close()
+            return result
+        except PlaywrightTimeout:
+            logger.warning(f"Timeout fetching description: {url}")
+            browser.close()
+            return ""
+        except Exception as e:
+            logger.warning(f"Error fetching description {url}: {e}")
+            browser.close()
+            return ""

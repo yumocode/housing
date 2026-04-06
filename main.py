@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 sf-rent-scraper — Main entry point.
-Fetches Craigslist SF rooms/shares via headless browser + internal JSON API,
-filters, scores with Claude Haiku, and texts good deals via Twilio.
+
+Pipeline:
+  1. Fetch all new Craigslist listings (title + price + neighborhood)
+  2. Batch pre-screen with one Haiku call → quick 1-10 score on titles alone
+  3. For listings scoring >= PRE_SCREEN_THRESHOLD: fetch full description
+  4. Full Haiku score on title + description
+  5. Text via Twilio if full score >= SCORE_THRESHOLD
 """
 
 import logging
@@ -13,10 +18,11 @@ from datetime import datetime
 
 import config
 from database import init_db, is_seen, save_listing, mark_notified
-from fetcher import fetch_listings
-from filters import passes_keyword_filter
-from scorer import score_listing
+from fetcher import fetch_new_listings, fetch_description
+from scorer import batch_prescreen, score_listing
 from notifier import send_sms
+
+PRE_SCREEN_THRESHOLD = 5  # batch pre-screen min score to fetch description
 
 
 def setup_logging():
@@ -33,63 +39,63 @@ logger = logging.getLogger("main")
 
 def run():
     setup_logging()
-
     logger.info("=" * 60)
     logger.info(f"sf-rent-scraper starting at {datetime.utcnow().isoformat()}Z")
 
     missing = config.validate_config()
     if missing:
-        logger.error(f"Missing required environment variables: {missing}")
+        logger.error(f"Missing required env vars: {missing}")
         sys.exit(1)
 
-    # Random jitter to avoid predictable timing
     jitter = random.uniform(0, 30)
     logger.info(f"Jitter sleep: {jitter:.1f}s")
     time.sleep(jitter)
 
     init_db()
 
-    # Fetch + dedupe + title-filter + description fetch all happen in fetcher
-    candidates = fetch_listings(is_seen_fn=is_seen, max_descriptions=config.MAX_LLM_CALLS_PER_RUN)
-
-    if not candidates:
-        logger.info("No new candidates this run.")
+    # --- Step 1: fetch new listings (title + price + neighborhood only) ---
+    new_listings = fetch_new_listings(is_seen_fn=is_seen)
+    if not new_listings:
+        logger.info("No new listings this run.")
         sys.exit(0)
 
+    # --- Step 2: batch pre-screen (1 Haiku call for all new listings) ---
+    pre_scores = batch_prescreen(new_listings)
+
+    finalists = []
+    for listing in new_listings:
+        pre_score = pre_scores.get(listing["id"], 6)
+        listing["_pre_score"] = pre_score
+        if pre_score <= PRE_SCREEN_THRESHOLD:
+            logger.info(f"[PRE-REJECT {pre_score}/10] {listing['title']!r}")
+            save_listing({**listing, "score": pre_score, "summary": f"pre-screen score {pre_score}/10"})
+        else:
+            logger.info(f"[PRE-PASS {pre_score}/10] {listing['title']!r}")
+            finalists.append(listing)
+
+    logger.info(f"{len(finalists)} listings passed pre-screen, fetching descriptions.")
+
+    # --- Step 3: fetch descriptions for finalists only ---
+    for listing in finalists:
+        logger.info(f"Fetching description: {listing['url']}")
+        listing["description"] = fetch_description(listing["url"])
+        time.sleep(1.5)
+
+    # --- Step 4 & 5: full score + notify ---
     llm_calls = 0
     notified_count = 0
 
-    for listing in candidates:
+    for listing in finalists:
+        if llm_calls >= config.MAX_LLM_CALLS_PER_RUN:
+            logger.warning(f"Hit LLM limit ({config.MAX_LLM_CALLS_PER_RUN}). Remaining deferred.")
+            break
+
         try:
-            # Listings rejected at title stage are pre-marked, just save and skip
-            if listing.get("_skip_scoring"):
-                save_listing({k: v for k, v in listing.items() if k != "_skip_scoring"})
-                continue
-
-            # Stage 1: full keyword filter (title + description now available)
-            passes, rejected_by = passes_keyword_filter(
-                listing["title"], listing["description"]
-            )
-            if not passes:
-                logger.info(f"[REJECT-KW] {listing['title']!r} — {rejected_by}")
-                save_listing({**listing, "score": 0, "summary": "rejected by keyword filter"})
-                continue
-
-            # Stage 2: LLM scoring
-            if llm_calls >= config.MAX_LLM_CALLS_PER_RUN:
-                logger.warning(
-                    f"Hit LLM call limit ({config.MAX_LLM_CALLS_PER_RUN}). "
-                    "Remaining listings deferred to next run."
-                )
-                break
-
-            logger.info(f"[SCORING] {listing['title']!r} @ ${listing['price']}")
             score_result = score_listing(listing)
             llm_calls += 1
 
             if score_result is None:
-                logger.warning(f"Scoring failed for {listing['id']}; saving as seen.")
-                save_listing({**listing, "score": -1, "summary": "scoring failed"})
+                save_listing({**listing, "score": -1, "summary": "full scoring failed"})
                 continue
 
             listing.update({
@@ -99,35 +105,26 @@ def run():
                 "summary": score_result["summary"],
                 "neighborhood": score_result.get("neighborhood") or listing["neighborhood"],
             })
-
             save_listing(listing)
 
-            # Stage 3: notify if score meets threshold
             if score_result["score"] >= config.SCORE_THRESHOLD:
-                logger.info(
-                    f"[HIT] {listing['title']!r} scored {score_result['score']}/10 — texting."
-                )
-                sent = send_sms(listing, score_result)
-                if sent:
+                logger.info(f"[HIT {score_result['score']}/10] {listing['title']!r} — texting.")
+                if send_sms(listing, score_result):
                     mark_notified(listing["id"])
                     notified_count += 1
             else:
-                logger.info(
-                    f"[LOW] {listing['title']!r} scored {score_result['score']}/10 — below threshold."
-                )
+                logger.info(f"[LOW {score_result['score']}/10] {listing['title']!r}")
 
         except Exception as e:
-            logger.error(
-                f"Unhandled error processing listing {listing.get('id', '?')}: {e}",
-                exc_info=True,
-            )
+            logger.error(f"Error processing {listing.get('id')}: {e}", exc_info=True)
             try:
                 save_listing({**listing, "score": -1, "summary": f"error: {e}"})
             except Exception:
                 pass
-            continue
 
-    logger.info(f"Run complete. LLM calls: {llm_calls}, texts sent: {notified_count}.")
+    logger.info(
+        f"Done. Pre-screen: 1 call. Full scores: {llm_calls}. Texts sent: {notified_count}."
+    )
 
 
 if __name__ == "__main__":
