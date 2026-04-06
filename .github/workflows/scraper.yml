@@ -24,7 +24,10 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
 
       # SQLite DB needs to persist between runs.
       # We store it as a GitHub Actions cache keyed by a fixed key.
