@@ -1,0 +1,56 @@
+name: SF Rent Scraper
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub Actions minimum resolution is 5 minutes.
+    # NOTE: Free tier is 2,000 min/month for PRIVATE repos — this will exceed it
+    # (~4,320 runs/month). Use this for PUBLIC repos or accept the ~$0.50/month overage.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # SQLite DB needs to persist between runs.
+      # We store it as a GitHub Actions cache keyed by a fixed key.
+      # This is a lightweight workaround — the DB resets if cache evicts (~7 days inactivity).
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: sf_rent_scraper.db
+          key: sf-rent-scraper-db
+          restore-keys: sf-rent-scraper-db
+
+      - name: Run scraper
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          MY_PHONE_NUMBER: ${{ secrets.MY_PHONE_NUMBER }}
+          SCORE_THRESHOLD: ${{ vars.SCORE_THRESHOLD || '7' }}
+          MAX_PRICE: ${{ vars.MAX_PRICE || '1000' }}
+        run: python main.py
+
+      # Save updated DB back to cache after each run
+      - name: Save database cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sf_rent_scraper.db
+          key: sf-rent-scraper-db-${{ github.run_id }}
