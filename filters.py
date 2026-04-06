@@ -3,96 +3,45 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-POSITIVE_KEYWORDS = [
-    "rent control",
-    "rent-controlled",
-    "rent controlled",
-    "victorian",
-    "pre-war",
-    "prewar",
-    "old building",
-    "lease takeover",
-    "taking over lease",
-    "sunset",
-    "richmond",
-    "excelsior",
-    "outer mission",
-    "bayview",
-    "chinatown",
-    "dogpatch",
-    "soma",
-    "mission",
-    "haight",
-    "noe valley",
-    "castro",
-    "glen park",
-    "bernal heights",
-    "loft",
-    "warehouse",
-    "artist",
-    "creative",
-    "musician",
-    "chill",
-    "laid back",
-    "easygoing",
-    "easy going",
-    "420 friendly",
-    "420friendly",
-]
-
+# Only reject listings that are provably NOT a room for rent.
+# Everything else goes to Haiku — let the LLM decide.
+# Keep this list short and unambiguous to avoid missing real deals.
 NEGATIVE_KEYWORDS = [
+    # Definitely not a room
     "parking only",
+    "parking space",
+    "storage unit",
     "storage only",
-    "temporary",
-    "short term",
-    "short-term",
-    "2 weeks",
-    "1 month only",
-    "hotel",
-    "hostel",
-    "shared bed",
-    "send money before viewing",
-    "send deposit before",
+    # Scam giveaways (not subjective — these phrases don't appear in legit posts)
+    "western union",
+    "wire transfer",
+    "money order only",
+    "send money before",
     "i'm out of town",
     "im out of town",
     "i am out of town",
-    "western union",
-    "money order only",
-    "wire transfer",
-    "pay before you see",
-    "no viewing",
-    "can't show",
-    "cannot show",
-    "non-refundable deposit",
-    "nonrefundable deposit",
-    "deposit is non refundable",
+    # Weekly hotel / hostel / shared bed (per-week pricing at <$1k is never a real apt)
+    "price is weekly",
+    "per week",
+    "shared bed",
+    "hostel",
 ]
-
-
-def _normalize(text: str) -> str:
-    return text.lower()
 
 
 def passes_keyword_filter(title: str, description: str) -> tuple[bool, list[str]]:
     """
-    Returns (passes: bool, matched_negative_keywords: list).
-    A listing fails if it matches any negative keyword.
-    Positive keywords are informational only — we don't require them.
+    Hard-reject only listings that are provably not a real room.
+    Returns (passes, list_of_matched_negative_keywords).
     """
-    combined = _normalize(f"{title} {description}")
-
-    matched_negatives = [kw for kw in NEGATIVE_KEYWORDS if kw in combined]
-    if matched_negatives:
-        logger.debug(f"Listing rejected by negative keywords: {matched_negatives}")
-        return False, matched_negatives
-
-    matched_positives = [kw for kw in POSITIVE_KEYWORDS if kw in combined]
-    logger.debug(f"Listing passed keyword filter. Positive matches: {matched_positives}")
+    combined = f"{title} {description}".lower()
+    matched = [kw for kw in NEGATIVE_KEYWORDS if kw in combined]
+    if matched:
+        logger.debug(f"Keyword reject: {matched}")
+        return False, matched
     return True, []
 
 
 def extract_price(text: str) -> int | None:
-    """Best-effort price extraction from listing text."""
     matches = re.findall(r"\$(\d{3,4})", text)
     if matches:
         return int(matches[0])
