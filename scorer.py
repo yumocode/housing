@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import anthropic
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 
@@ -132,6 +133,10 @@ def score_listing(listing: dict) -> dict | None:
             messages=[{"role": "user", "content": user_msg}],
         )
         raw = response.content[0].text.strip()
+        # Strip markdown code fences if Haiku wrapped the JSON
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[^\n]*\n?", "", raw)
+            raw = re.sub(r"```$", "", raw).strip()
         result = json.loads(raw)
 
         required = {"score", "rent_control_likely", "scam_risk", "summary", "neighborhood"}
